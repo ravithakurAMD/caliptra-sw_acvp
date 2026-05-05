@@ -118,7 +118,7 @@ impl<'a> Mldsa87<'a> {
 
     // Wait on the provided condition OR the error condition defined in this function
     // In the event of the error condition being set, clear the error bits and return an error
-    fn wait<F>(regs: RegisterBlock<caliptra_ureg::RealMmioMut>, condition: F) -> CaliptraResult<()>
+    fn wait<F>(regs: RegisterBlock<ureg::RealMmioMut>, condition: F) -> CaliptraResult<()>
     where
         F: Fn() -> bool,
     {
@@ -364,10 +364,7 @@ impl<'a> Mldsa87<'a> {
         self.sign_internal(seed, pub_key, SigData::Mu(mu), sign_rnd, trng)
     }
 
-    fn program_var_msg(
-        mldsa: RegisterBlock<caliptra_ureg::RealMmioMut>,
-        msg: &[u8],
-    ) -> CaliptraResult<()> {
+    fn program_var_msg(mldsa: RegisterBlock<ureg::RealMmioMut>, msg: &[u8]) -> CaliptraResult<()> {
         // Wait for stream ready or valid status.
         Mldsa87::wait(mldsa, || {
             mldsa.mldsa_status().read().msg_stream_ready() || mldsa.mldsa_status().read().valid()
@@ -391,6 +388,8 @@ impl<'a> Mldsa87<'a> {
             mldsa.mldsa_msg().at(0).write(|_| dw.get());
         }
 
+        // For a partial last word, set strobe bits for valid bytes only (LSB first).
+        // For a word-aligned message, strobe=0 + one zero write acts as the terminator.
         let last_strobe = match remainder.len() {
             0 => 0b0000,
             1 => 0b0001,
@@ -468,6 +467,61 @@ impl<'a> Mldsa87<'a> {
         } else {
             Err(CaliptraError::DRIVER_MLDSA87_SIGN_VALIDATION_FAILED)
         }
+    }
+
+    /// Sign a variable-length message with the specified private key, skipping the
+    /// post-sign verification step. Intended for ACVP testing only, where the public
+    /// key is not available and the anti-glitch check cannot be performed.
+    pub fn sign_var_no_verify(
+        &mut self,
+        seed: Mldsa87Seed,
+        msg: &[u8],
+        sign_rnd: &Mldsa87SignRnd,
+        trng: &mut Trng,
+    ) -> CaliptraResult<Mldsa87Signature> {
+        let mut gen_keypair = true;
+        let mldsa = self.mldsa87.regs_mut();
+
+        // Wait for hardware ready
+        Mldsa87::wait(mldsa, || mldsa.mldsa_status().read().ready())?;
+
+        // Sign RND.
+        sign_rnd.write_to_reg(mldsa.mldsa_sign_rnd());
+
+        // Generate randomness for SCA protection.
+        trng.generate16()?.write_to_reg(mldsa.entropy());
+
+        // Copy seed or the private key to the hardware
+        match seed {
+            Mldsa87Seed::Array4x8(arr) => arr.write_to_reg(mldsa.mldsa_seed()),
+            Mldsa87Seed::Key(key) => KvAccess::copy_from_kv(
+                key,
+                mldsa.kv_mldsa_seed_rd_status(),
+                mldsa.kv_mldsa_seed_rd_ctrl(),
+            )
+            .map_err(|err| err.into_read_seed_err())?,
+            Mldsa87Seed::PrivKey(priv_key) => {
+                gen_keypair = false;
+                priv_key.write_to_reg(mldsa.mldsa_privkey_in())
+            }
+        }
+
+        // Program the command register
+        mldsa.mldsa_ctrl().write(|w| {
+            w.ctrl(if gen_keypair { KEYGEN_SIGN } else { SIGN })
+                .stream_msg(true)
+        });
+
+        // Program the message to the hardware
+        Mldsa87::program_var_msg(mldsa, msg)?;
+
+        // Copy signature
+        let signature = Mldsa87Signature::read_from_reg(mldsa.mldsa_signature());
+
+        // Clear the hardware.
+        mldsa.mldsa_ctrl().write(|w| w.zeroize(true));
+
+        Ok(signature)
     }
 
     /// Common setup for verification functions
@@ -586,6 +640,57 @@ impl<'a> Mldsa87<'a> {
         let verify_res = LEArray4x16::read_from_reg(mldsa.mldsa_verify_res());
 
         // Clear the hardware when done
+        mldsa.mldsa_ctrl().write(|w| w.zeroize(true));
+
+        let result = if verify_res.0 == truncated_signature {
+            cfi_assert_eq_16_words(&verify_res.0, &truncated_signature);
+            Mldsa87Result::Success
+        } else {
+            Mldsa87Result::SigVerifyFailed
+        };
+
+        Ok(result)
+    }
+
+    #[cfg_attr(feature = "cfi", cfi_impl_fn)]
+    pub fn verify_var_with_ctx(
+        &mut self,
+        pub_key: &Mldsa87PubKey,
+        msg: &[u8],
+        ctx: &[u8],
+        signature: &Mldsa87Signature,
+    ) -> CaliptraResult<Mldsa87Result> {
+        // Context must not exceed 255 bytes (2040 bits) per FIPS 204.
+        if ctx.len() > 255 {
+            return Err(CaliptraError::DRIVER_MLDSA87_INVALID_CONTEXT_SIZE);
+        }
+
+        let truncated_signature = self.verify_common_setup(pub_key, signature)?;
+        let mldsa = self.mldsa87.regs_mut();
+
+        // Program context size (0 = no context binding).
+        mldsa.mldsa_ctx_config().write(|w| w.ctx_size(ctx.len() as u32));
+
+        // Pack context bytes into u32 words and write to context registers.
+        // Partial last word is zero-padded.
+        for (i, chunk) in ctx.chunks(4).enumerate() {
+            let mut buf = [0u8; 4];
+            buf[..chunk.len()].copy_from_slice(chunk);
+            mldsa.mldsa_ctx().at(i).write(|_| u32::from_le_bytes(buf));
+        }
+
+        // Program the command register for signature verification with streaming.
+        mldsa
+            .mldsa_ctrl()
+            .write(|w| w.ctrl(VERIFY).stream_msg(true));
+
+        // Stream the message to the hardware.
+        Mldsa87::program_var_msg(mldsa, msg)?;
+
+        // Copy the result.
+        let verify_res = LEArray4x16::read_from_reg(mldsa.mldsa_verify_res());
+
+        // Clear the hardware when done.
         mldsa.mldsa_ctrl().write(|w| w.zeroize(true));
 
         let result = if verify_res.0 == truncated_signature {

@@ -369,6 +369,11 @@ impl CaliptraError {
             "Driver Error: MLDSA87 key generation pairwise consistency failure"
         ),
         (
+            DRIVER_MLDSA87_INVALID_CONTEXT_SIZE,
+            0x00058008,
+            "Driver Error: MLDSA87 context size exceeds 255 bytes"
+        ),
+        (
             DRIVER_MLKEM_READ_SEED_KV_READ,
             0x00059000,
             "Driver Error: ML-KEM read seed KV read"
