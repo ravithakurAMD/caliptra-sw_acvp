@@ -524,6 +524,59 @@ impl<'a> Mldsa87<'a> {
         Ok(signature)
     }
 
+    /// Sign a variable-length message with context using a caller-provided private key,
+    /// skipping the post-sign verification step.  Intended for ACVP sigGen testing where
+    /// context binding is required but no public key is available for the anti-glitch check.
+    pub fn sign_var_with_ctx_no_verify(
+        &mut self,
+        priv_key: &Mldsa87PrivKey,
+        msg: &[u8],
+        ctx: &[u8],
+        sign_rnd: &Mldsa87SignRnd,
+        trng: &mut Trng,
+    ) -> CaliptraResult<Mldsa87Signature> {
+        // Context must not exceed 255 bytes (2040 bits) per FIPS 204.
+        if ctx.len() > 255 {
+            return Err(CaliptraError::DRIVER_MLDSA87_INVALID_CONTEXT_SIZE);
+        }
+
+        let mldsa = self.mldsa87.regs_mut();
+
+        // Wait for hardware ready.
+        Mldsa87::wait(mldsa, || mldsa.mldsa_status().read().ready())?;
+
+        // Sign RND.
+        sign_rnd.write_to_reg(mldsa.mldsa_sign_rnd());
+
+        // Generate randomness for SCA protection.
+        trng.generate16()?.write_to_reg(mldsa.entropy());
+
+        // Write private key directly (no keypair generation needed).
+        priv_key.write_to_reg(mldsa.mldsa_privkey_in());
+
+        // Program context size and context bytes (partial last word is zero-padded).
+        mldsa.mldsa_ctx_config().write(|w| w.ctx_size(ctx.len() as u32));
+        for (i, chunk) in ctx.chunks(4).enumerate() {
+            let mut buf = [0u8; 4];
+            buf[..chunk.len()].copy_from_slice(chunk);
+            mldsa.mldsa_ctx().at(i).write(|_| u32::from_le_bytes(buf));
+        }
+
+        // Program the command register for signing with message streaming.
+        mldsa.mldsa_ctrl().write(|w| w.ctrl(SIGN).stream_msg(true));
+
+        // Stream the message to the hardware.
+        Mldsa87::program_var_msg(mldsa, msg)?;
+
+        // Copy signature.
+        let signature = Mldsa87Signature::read_from_reg(mldsa.mldsa_signature());
+
+        // Clear the hardware.
+        mldsa.mldsa_ctrl().write(|w| w.zeroize(true));
+
+        Ok(signature)
+    }
+
     /// Common setup for verification functions
     /// Returns the truncated signature for later comparison
     fn verify_common_setup(
